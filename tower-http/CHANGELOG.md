@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Changed
+
+- `follow-redirect`: Request extensions are now preserved across redirects. Previously extensions were silently dropped due to a stale assumption that `http::Extensions` was `!Clone` (resolved in http 1.x). Extensions are cloned into the redirected request before `Policy::on_request` is called, so policies can strip sensitive types if needed:
+
+  ```rust
+  impl<B, E> Policy<B, E> for StripSensitiveExtensions {
+      fn redirect(&mut self, _: &Attempt<'_>) -> Result<Action, E> {
+          Ok(Action::Follow)
+      }
+
+      fn on_request(&mut self, request: &mut Request<B>) {
+          request.extensions_mut().remove::<MySecret>();
+      }
+  }
+  ```
+
 # 0.6.11
 
 ## Added

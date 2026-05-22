@@ -6,11 +6,37 @@
 //! redirections.
 //!
 //! The middleware tries to clone the original [`Request`] when making a redirected request.
-//! However, since [`Extensions`][http::Extensions] are `!Clone`, any extensions set by outer
-//! middleware will be discarded. Also, the request body cannot always be cloned. When the
-//! original body is known to be empty by [`Body::size_hint`], the middleware uses `Default`
-//! implementation of the body type to create a new request body. If you know that the body can be
-//! cloned in some way, you can tell the middleware to clone it by configuring a [`policy`].
+//! Extensions are preserved across redirects (cloned from the original request into each
+//! subsequent redirect). The request body cannot always be cloned. When the original body is
+//! known to be empty by [`Body::size_hint`], the middleware uses `Default` implementation of the
+//! body type to create a new request body. If you know that the body can be cloned in some way,
+//! you can tell the middleware to clone it by configuring a [`policy`].
+//!
+//! # Security Considerations
+//!
+//! Extensions are cloned into the redirected request before [`Policy::on_request`] is called.
+//! If your extensions contain sensitive data that should not be forwarded on cross-origin
+//! redirects, you can strip them in a custom [`Policy`] implementation:
+//!
+//! ```
+//! use http::Request;
+//! use tower_http::follow_redirect::policy::{Action, Attempt, Policy};
+//!
+//! #[derive(Clone)]
+//! struct StripSensitiveExtensions;
+//!
+//! struct MySecret(String);
+//!
+//! impl<B, E> Policy<B, E> for StripSensitiveExtensions {
+//!     fn redirect(&mut self, _: &Attempt<'_>) -> Result<Action, E> {
+//!         Ok(Action::Follow)
+//!     }
+//!
+//!     fn on_request(&mut self, request: &mut Request<B>) {
+//!         request.extensions_mut().remove::<MySecret>();
+//!     }
+//! }
+//! ```
 //!
 //! # Examples
 //!
@@ -98,8 +124,8 @@ use self::policy::{Action, Attempt, Policy, Standard};
 use futures_util::future::Either;
 use http::{
     header::CONTENT_ENCODING, header::CONTENT_LENGTH, header::CONTENT_TYPE, header::LOCATION,
-    header::TRANSFER_ENCODING, HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri,
-    Version,
+    header::TRANSFER_ENCODING, Extensions, HeaderMap, HeaderValue, Method, Request, Response,
+    StatusCode, Uri, Version,
 };
 use http_body::Body;
 use pin_project_lite::pin_project;
@@ -219,6 +245,7 @@ where
             uri: req.uri().clone(),
             version: req.version(),
             headers: req.headers().clone(),
+            extensions: req.extensions().clone(),
             body,
             future: Either::Left(service.call(req)),
             service,
@@ -242,6 +269,8 @@ pin_project! {
         uri: Uri,
         version: Version,
         headers: HeaderMap<HeaderValue>,
+        // Snapshot of the original request's extensions, cloned into each redirect.
+        extensions: Extensions,
         body: BodyRepr<B>,
     }
 }
@@ -325,6 +354,7 @@ where
                 *req.method_mut() = this.method.clone();
                 *req.version_mut() = *this.version;
                 *req.headers_mut() = this.headers.clone();
+                *req.extensions_mut() = this.extensions.clone();
                 this.policy.on_request(&mut req);
                 this.future
                     .set(Either::Right(Oneshot::new(this.service.clone(), req)));
@@ -732,6 +762,157 @@ mod tests {
             }
         };
         Ok::<_, Infallible>(res.body(body_str).unwrap())
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct MyExtension(String);
+
+    /// Extensions are preserved across a single redirect by default.
+    #[tokio::test]
+    async fn extensions_preserved_by_default() {
+        let svc = ServiceBuilder::new()
+            .layer(FollowRedirectLayer::with_policy(Action::Follow))
+            .buffer(1)
+            .service_fn(|req: Request<Body>| async move {
+                let ext = req.extensions().get::<MyExtension>().cloned();
+                let n: u64 = req.uri().path()[1..].parse().unwrap();
+                let mut res = Response::builder();
+                if n > 0 {
+                    res = res
+                        .status(StatusCode::MOVED_PERMANENTLY)
+                        .header(LOCATION, format!("/{}", n - 1));
+                }
+                let mut resp = res.body(n).unwrap();
+                if let Some(ext) = ext {
+                    resp.extensions_mut().insert(ext);
+                }
+                Ok::<_, Infallible>(resp)
+            });
+        let mut req = Request::builder()
+            .uri("http://example.com/1")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(MyExtension("hello".to_string()));
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(*res.body(), 0);
+        assert_eq!(
+            res.extensions().get::<MyExtension>().unwrap(),
+            &MyExtension("hello".to_string())
+        );
+    }
+
+    /// Extensions are preserved across multiple redirect hops.
+    #[tokio::test]
+    async fn extensions_preserved_across_multiple_hops() {
+        let svc = ServiceBuilder::new()
+            .layer(FollowRedirectLayer::with_policy(Limited::new(10)))
+            .buffer(1)
+            .service_fn(|req: Request<Body>| async move {
+                let ext = req.extensions().get::<MyExtension>().cloned();
+                let n: u64 = req.uri().path()[1..].parse().unwrap();
+                let mut res = Response::builder();
+                if n > 0 {
+                    res = res
+                        .status(StatusCode::MOVED_PERMANENTLY)
+                        .header(LOCATION, format!("/{}", n - 1));
+                }
+                let mut resp = res.body(n).unwrap();
+                if let Some(ext) = ext {
+                    resp.extensions_mut().insert(ext);
+                }
+                Ok::<_, Infallible>(resp)
+            });
+        let mut req = Request::builder()
+            .uri("http://example.com/5")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(MyExtension("multi-hop".to_string()));
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(*res.body(), 0);
+        assert_eq!(
+            res.extensions().get::<MyExtension>().unwrap(),
+            &MyExtension("multi-hop".to_string())
+        );
+    }
+
+    /// Extensions are preserved across cross-origin redirects.
+    #[tokio::test]
+    async fn extensions_preserved_cross_origin() {
+        let svc = ServiceBuilder::new()
+            .layer(FollowRedirectLayer::with_policy(Action::Follow))
+            .buffer(1)
+            .service_fn(|req: Request<Body>| async move {
+                let ext = req.extensions().get::<MyExtension>().cloned();
+                let mut res = Response::builder();
+                if req.uri().host() == Some("origin.example.com") {
+                    res = res
+                        .status(StatusCode::MOVED_PERMANENTLY)
+                        .header(LOCATION, "http://other.example.com/final");
+                }
+                let mut resp = res.body(req.uri().to_string()).unwrap();
+                if let Some(ext) = ext {
+                    resp.extensions_mut().insert(ext);
+                }
+                Ok::<_, Infallible>(resp)
+            });
+        let mut req = Request::builder()
+            .uri("http://origin.example.com/start")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(MyExtension("cross-origin".to_string()));
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(
+            res.extensions().get::<MyExtension>().unwrap(),
+            &MyExtension("cross-origin".to_string())
+        );
+    }
+
+    /// A Policy can strip extensions via on_request.
+    #[tokio::test]
+    async fn policy_can_strip_extensions() {
+        #[derive(Clone)]
+        struct StripPolicy;
+
+        impl<B, E> Policy<B, E> for StripPolicy {
+            fn redirect(&mut self, _: &Attempt<'_>) -> Result<Action, E> {
+                Ok(Action::Follow)
+            }
+            fn on_request(&mut self, req: &mut Request<B>) {
+                req.extensions_mut().remove::<MyExtension>();
+            }
+        }
+
+        let svc = ServiceBuilder::new()
+            .layer(FollowRedirectLayer::with_policy(StripPolicy))
+            .buffer(1)
+            .service_fn(|req: Request<Body>| async move {
+                let ext = req.extensions().get::<MyExtension>().cloned();
+                let n: u64 = req.uri().path()[1..].parse().unwrap();
+                let mut res = Response::builder();
+                if n > 0 {
+                    res = res
+                        .status(StatusCode::MOVED_PERMANENTLY)
+                        .header(LOCATION, format!("/{}", n - 1));
+                }
+                let mut resp = res.body(n).unwrap();
+                if let Some(ext) = ext {
+                    resp.extensions_mut().insert(ext);
+                }
+                Ok::<_, Infallible>(resp)
+            });
+        let mut req = Request::builder()
+            .uri("http://example.com/1")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(MyExtension("secret".to_string()));
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(*res.body(), 0);
+        // Extension was stripped by the policy
+        assert!(res.extensions().get::<MyExtension>().is_none());
     }
 
     #[tokio::test]
